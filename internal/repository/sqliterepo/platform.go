@@ -339,17 +339,17 @@ func NewIdempotencyRepo(tx *sqlite.TxManager) *IdempotencyRepo {
 	return &IdempotencyRepo{base{tx: tx}}
 }
 
-// Find loads a stored response for a scope, key and actor triple.
+// Find loads a stored response for a scope, key and actor triple. Each leader
+// owns an independent key namespace, so the lookup must match the actor exactly:
+// a key reused by another leader never collides.
 func (r *IdempotencyRepo) Find(ctx context.Context, scope, key string, actorID int64) (*repository.IdempotencyRecord, error) {
 	var record repository.IdempotencyRecord
 	var createdAt, expiresAt int64
-	// Records written by the shared request namespace carry actor_id 0, so the
-	// lookup also accepts those rows for any caller.
 	err := r.q(ctx).QueryRowContext(ctx,
 		`SELECT id, scope, idem_key, actor_id, request_hash, response_body, created_at, expires_at
 		 FROM idempotency_records
-		 WHERE scope = ? AND idem_key = ? AND (actor_id = ? OR actor_id = 0)
-		 ORDER BY actor_id DESC LIMIT 1`,
+		 WHERE scope = ? AND idem_key = ? AND actor_id = ?
+		 LIMIT 1`,
 		scope, key, actorID).
 		Scan(&record.ID, &record.Scope, &record.Key, &record.ActorID, &record.RequestHash,
 			&record.ResponseBody, &createdAt, &expiresAt)

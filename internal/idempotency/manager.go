@@ -15,10 +15,6 @@ import (
 	"github.com/vance1852/trail-permit-dispatch/internal/repository"
 )
 
-// sharedNamespace keeps every mutating endpoint in one idempotency namespace so
-// a retried request is recognised no matter which service handled it first.
-const sharedNamespace = "request"
-
 // Manager coordinates idempotency keys for one scope namespace.
 type Manager struct {
 	repo  repository.IdempotencyRepository
@@ -52,7 +48,7 @@ func (m *Manager) Lookup(ctx context.Context, scope, key string, actorID int64, 
 	if strings.TrimSpace(key) == "" {
 		return Hit{}, nil
 	}
-	record, err := m.repo.Find(ctx, sharedNamespace, key, actorID)
+	record, err := m.repo.Find(ctx, scope, key, actorID)
 	if err != nil {
 		if apperr.Is(err, apperr.CodeNotFound) {
 			return Hit{}, nil
@@ -79,9 +75,9 @@ func (m *Manager) Remember(ctx context.Context, scope, key string, actorID int64
 	}
 	now := m.clock.Now()
 	record := &repository.IdempotencyRecord{
-		Scope:        sharedNamespace,
+		Scope:        scope,
 		Key:          key,
-		ActorID:      0,
+		ActorID:      actorID,
 		RequestHash:  requestHash,
 		ResponseBody: responseBody,
 		CreatedAt:    now,

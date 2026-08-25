@@ -624,3 +624,55 @@ func TestIdempotencyRecords(t *testing.T) {
 		t.Fatalf("应清理 1 条过期记录，实际 %d", deleted)
 	}
 }
+
+// TestIdempotencyKeysAreScopedPerLeader reproduces the cross leader collision:
+// two leaders submitting the same key for different parties must each reserve
+// their own seats, while a repeated key from the same leader must deduplicate.
+func TestIdempotencyKeysAreScopedPerLeader(t *testing.T) {
+	ctx := context.Background()
+	fix := newFixture(t)
+	leaderA := fix.newUser("leaderA@trail.local", domain.RoleLeader)
+	leaderB := fix.newUser("leaderB@trail.local", domain.RoleLeader)
+
+	save := func(actorID int64, hash, body string) {
+		t.Helper()
+		record := &repository.IdempotencyRecord{
+			Scope: "party.permit_request", Key: "shared-key", ActorID: actorID,
+			RequestHash: hash, ResponseBody: body,
+			CreatedAt: testNow(), ExpiresAt: testNow().Add(time.Hour),
+		}
+		if _, err := fix.idem.Save(ctx, record); err != nil {
+			t.Fatalf("保存幂等记录失败: %v", err)
+		}
+	}
+
+	// Leader A reserves with the shared key.
+	save(leaderA.ID, "hash-A", `{"code":"TP-A"}`)
+	// Leader B submits the same key but a different request; it must not collide.
+	save(leaderB.ID, "hash-B", `{"code":"TP-B"}`)
+
+	a, err := fix.idem.Find(ctx, "party.permit_request", "shared-key", leaderA.ID)
+	if err != nil {
+		t.Fatalf("读取领队 A 的幂等记录失败: %v", err)
+	}
+	if a.RequestHash != "hash-A" || a.ResponseBody != `{"code":"TP-A"}` {
+		t.Fatalf("领队 A 的记录被串号: %+v", a)
+	}
+	b, err := fix.idem.Find(ctx, "party.permit_request", "shared-key", leaderB.ID)
+	if err != nil {
+		t.Fatalf("读取领队 B 的幂等记录失败: %v", err)
+	}
+	if b.RequestHash != "hash-B" || b.ResponseBody != `{"code":"TP-B"}` {
+		t.Fatalf("领队 B 的记录被串号: %+v", b)
+	}
+
+	// The same leader resubmitting the identical key and body must still dedupe.
+	dup := &repository.IdempotencyRecord{
+		Scope: "party.permit_request", Key: "shared-key", ActorID: leaderA.ID,
+		RequestHash: "hash-A", ResponseBody: `{"code":"TP-A-replay"}`,
+		CreatedAt: testNow(), ExpiresAt: testNow().Add(time.Hour),
+	}
+	if _, err := fix.idem.Save(ctx, dup); !apperr.Is(err, apperr.CodeConflict) {
+		t.Fatalf("同一领队重复写入同一幂等键应返回 conflict，实际 %v", err)
+	}
+}
