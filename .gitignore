@@ -1,0 +1,9 @@
+/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/bin/
+/dist/
+.env
+coverage.out
+*.test
