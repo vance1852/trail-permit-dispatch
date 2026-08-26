@@ -1,6 +1,7 @@
 package apptest
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -115,6 +116,66 @@ func TestPartyLifecycleFromPlanToSettlement(t *testing.T) {
 	}
 	if settled.Reference == "" || settled.SettledAt == nil {
 		t.Fatalf("结算凭证缺失: %+v", settled)
+	}
+}
+
+// TestSettlePartyMarkedFailedWhenBusinessImpossible reproduces the silent-loss
+// bug: a settle job whose business outcome is impossible (the party has not
+// finished its trip) used to be recorded as done while the settlement record
+// stayed pending and no follow-up surfaced. The job must now record the
+// failure with its reason and mark the settlement as failed.
+func TestSettlePartyMarkedFailedWhenBusinessImpossible(t *testing.T) {
+	h := newHarness(t)
+	leader := h.leader()
+
+	party := h.readyParty(leader, valleyTrail, 3, 1)
+	if _, err := h.app.Dispatch.RequestPermit(h.ctx(), leader, party.Code, "idem-impossible"); err != nil {
+		t.Fatalf("申请许可失败: %v", err)
+	}
+	before, err := h.app.Settlements.ForParty(h.ctx(), leader, party.Code)
+	if err != nil {
+		t.Fatalf("读取结算记录失败: %v", err)
+	}
+	if before.State != string(domain.SettlementPending) {
+		t.Fatalf("申请许可后应生成待结算记录，实际 %s", before.State)
+	}
+
+	// The party is still permit_reserved, so settling is business-impossible.
+	// Enqueue a settle job directly, as if completion had scheduled it early.
+	partyID, err := h.app.Dispatch.PartyIDByCode(h.ctx(), party.Code)
+	if err != nil {
+		t.Fatalf("解析队伍标识失败: %v", err)
+	}
+	now := clock.Truncate(h.clock.Now())
+	if _, err := h.app.Jobs.Enqueue(h.ctx(), &domain.Job{
+		Kind:        domain.JobSettleParty,
+		Payload:     `{"party_id":` + strconv.FormatInt(partyID, 10) + `}`,
+		MaxAttempts: h.app.Config.JobMaxAttempts,
+		RunAt:       now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("入队结算作业失败: %v", err)
+	}
+
+	if processed := h.drainJobs(10); processed == 0 {
+		t.Fatal("应有后台结算作业被执行")
+	}
+
+	// The job must not be silently recorded as done: it failed permanently and
+	// surfaced the reason, and the settlement record must reflect that.
+	failed, err := h.app.Settlements.ForParty(h.ctx(), leader, party.Code)
+	if err != nil {
+		t.Fatalf("读取结算记录失败: %v", err)
+	}
+	if failed.State != string(domain.SettlementFailed) {
+		t.Fatalf("业务上不可完成的结算应标记为 failed，实际 %s", failed.State)
+	}
+	if failed.FailureNote == "" {
+		t.Fatalf("应如实留下失败原因，实际 %+v", failed)
+	}
+	if failed.Reference != "" || failed.SettledAt != nil {
+		t.Fatalf("失败的结算不应写出凭证，实际 %+v", failed)
 	}
 }
 

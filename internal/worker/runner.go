@@ -228,17 +228,19 @@ func (r *Runner) execute(ctx context.Context, job domain.Job) {
 	jobCtx, cancel := context.WithTimeout(ctx, r.options.JobTimeout)
 	defer cancel()
 
-	// 先释放租约并落库完成状态，这样处理器执行期间租约到期也不会被其他
+	// 先执行处理器，再落库终态：作业在处理器执行期间仍持有租约，因此一次
+	// 业务失败不会被误记为成功。仅在处理器返回 nil 时标记完成；任何错误都
+	// 走 fail 记录失败状态与原因，并在永久失败时触发钩子，把对应的业务对象
+	// 标记出来。终态用不可取消的上下文落库，即使处理器超时也能如实记录。
+	// 默认租约长于作业超时，行为良好的处理器会在租约过期前结束，不会被其他
 	// worker 重复领取。
-	bookkeeping := context.WithoutCancel(ctx)
-	if markErr := r.jobs.MarkDone(bookkeeping, job.ID, r.clock.Now()); markErr != nil {
-		r.logger.Error("标记作业完成失败",
-			slog.Int64("job_id", job.ID), slog.String("error", markErr.Error()))
-		return
-	}
-
 	err := runHandler(jobCtx, handler, job)
 	if err == nil {
+		bookkeeping := context.WithoutCancel(ctx)
+		if markErr := r.jobs.MarkDone(bookkeeping, job.ID, r.clock.Now()); markErr != nil {
+			r.logger.Error("标记作业完成失败",
+				slog.Int64("job_id", job.ID), slog.String("error", markErr.Error()))
+		}
 		return
 	}
 	permanent := job.Attempts >= job.MaxAttempts || terminal(err)
