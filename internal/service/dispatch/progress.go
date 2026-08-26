@@ -194,12 +194,10 @@ func (s *Service) CancelParty(ctx context.Context, actor domain.Actor, code, rea
 		if err := s.waiveSettlement(txCtx, party.ID, "队伍取消出行", now); err != nil {
 			return err
 		}
-		// 兜底再归还一次，确保取消流程不会漏掉名额归还。
-		if party.PermitWindowID != nil {
-			if err := s.permits.ReleaseSeats(txCtx, *party.PermitWindowID, party.Size, now); err != nil {
-				return err
-			}
-		}
+		// releasePermit above has already returned this party's seats. Releasing
+		// a second time would claw back other parties' reservations too, because
+		// ReleaseSeats clamps the counter down without per-party bookkeeping. Do
+		// not release again.
 		return s.audit.Success(txCtx, actor, ActionPartyCancel, audit.ObjectParty, party.Code, detail)
 	})
 	if err != nil {

@@ -142,27 +142,36 @@ func (r *PermitRepo) ReserveSeats(ctx context.Context, windowID int64, expectedV
 }
 
 // ReleaseSeats returns seats to a window when a party leaves the permit holding
-// states. The guard keeps the reserved counter from going negative.
+// states. The WHERE clause refuses to drop the reserved counter below zero, so
+// a release larger than the currently reserved amount is rejected rather than
+// clamped — clamping would silently claw back other parties' seats.
 func (r *PermitRepo) ReleaseSeats(ctx context.Context, windowID int64, seats int, now time.Time) error {
 	if seats <= 0 {
 		return apperr.New(apperr.CodeInvalidArgument, "释放座位数必须大于 0")
 	}
-	// 归还是幂等操作：即使同一笔占用被重复归还，也把结果收敛到不小于 0，
-	// 避免并发归还时抛出难以处理的冲突错误。
 	affected, err := affectedRows("释放许可名额", func() (sql.Result, error) {
 		return r.q(ctx).ExecContext(ctx,
 			`UPDATE permit_windows
-			 SET quota_reserved = MAX(quota_reserved - ?, 0), version = version + 1, updated_at = ?
-			 WHERE id = ?`,
-			seats, unixOrZero(now), windowID)
+			 SET quota_reserved = quota_reserved - ?, version = version + 1, updated_at = ?
+			 WHERE id = ? AND quota_reserved >= ?`,
+			seats, unixOrZero(now), windowID, seats)
 	})
 	if err != nil {
 		return err
 	}
-	if affected == 0 {
-		return apperr.New(apperr.CodeNotFound, "许可窗口不存在，无法归还名额")
+	if affected > 0 {
+		return nil
 	}
-	return nil
+	current, loadErr := r.WindowByID(ctx, windowID)
+	if loadErr != nil {
+		return loadErr
+	}
+	if current.QuotaReserved < seats {
+		return apperr.Newf(apperr.CodeConflict,
+			"%s 的已占用名额为 %d，不足以归还 %d 个，拒绝跨队伍归还",
+			current.HikeDay, current.QuotaReserved, seats)
+	}
+	return apperr.New(apperr.CodeConflict, "释放许可名额失败，请重试")
 }
 
 // Close stops a permit window from accepting further reservations.

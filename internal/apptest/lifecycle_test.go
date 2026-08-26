@@ -276,6 +276,46 @@ func TestCancelReleasesQuotaAndWaivesFee(t *testing.T) {
 	}
 }
 
+// TestCancelOnlyReleasesThatPartysSeats reproduces the Qingxi valley incident:
+// two parties each held 4 seats (8 total); cancelling one must release only
+// its own 4 seats and leave the other party's reservation and the quota total
+// intact. The window must not be zeroed out.
+func TestCancelOnlyReleasesThatPartysSeats(t *testing.T) {
+	h := newHarness(t)
+	first := h.leader()
+	second := h.newLeader("second@trailpermit.test")
+
+	partyA := h.readyParty(first, valleyTrail, 4, 1)
+	partyB := h.readyParty(second, valleyTrail, 4, 1)
+	if _, err := h.app.Dispatch.RequestPermit(h.ctx(), first, partyA.Code, ""); err != nil {
+		t.Fatalf("队伍A申请许可失败: %v", err)
+	}
+	if _, err := h.app.Dispatch.RequestPermit(h.ctx(), second, partyB.Code, ""); err != nil {
+		t.Fatalf("队伍B申请许可失败: %v", err)
+	}
+	if occupied, total := h.permitWindow(valleyTrail, 1); occupied != 8 || total != 30 {
+		t.Fatalf("两支队伍共应占用 8 个名额，实际 reserved=%d total=%d", occupied, total)
+	}
+
+	if _, err := h.app.Dispatch.CancelParty(h.ctx(), first, partyA.Code, "临时改期"); err != nil {
+		t.Fatalf("取消队伍A失败: %v", err)
+	}
+	if occupied, total := h.permitWindow(valleyTrail, 1); occupied != 4 || total != 30 {
+		t.Fatalf("取消一支队伍后应仅归还该队 4 个名额，另一队伍占用须保留，实际 reserved=%d total=%d", occupied, total)
+	}
+
+	// 取消的一方必须不再占用名额，被留下的队伍仍可被领队查看且状态不变。
+	if _, err := h.app.Dispatch.GetParty(h.ctx(), second, partyB.Code); err != nil {
+		t.Fatalf("队伍B仍应存在: %v", err)
+	}
+	if _, err := h.app.Dispatch.CancelParty(h.ctx(), second, partyB.Code, "之后取消"); err != nil {
+		t.Fatalf("取消队伍B失败: %v", err)
+	}
+	if occupied, _ := h.permitWindow(valleyTrail, 1); occupied != 0 {
+		t.Fatalf("两支队伍均取消后名额应清零，实际 %d", occupied)
+	}
+}
+
 func TestLeaderCannotTouchAnotherLeadersParty(t *testing.T) {
 	h := newHarness(t)
 	owner := h.leader()
