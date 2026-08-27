@@ -277,18 +277,11 @@ func (a *App) Ready(ctx context.Context) (httpapi.ReadyReport, error) {
 	}, nil
 }
 
-// StartWorker reclaims stale leases, ensures the recurring jobs exist and starts
-// the background workers.
+// StartWorker ensures the recurring jobs exist and starts the background workers.
+// Reclaiming leases left by a crashed instance happens inside Worker.Start and on
+// every poll, using locked_until <= now as the only expiry signal, so recently
+// stranded jobs are picked up instead of waiting for a 24h safety margin.
 func (a *App) StartWorker(ctx context.Context) error {
-	// 只回收明显被遗弃的租约，避免把仍在执行的作业从其它实例手里抢走。
-	staleBefore := a.Clock.Now().Add(-24 * time.Hour)
-	reclaimed, err := a.Jobs.ReclaimExpiredLeases(ctx, staleBefore)
-	if err != nil {
-		return err
-	}
-	if reclaimed > 0 {
-		a.Logger.Info("启动时回收遗弃的作业租约", slog.Int("reclaimed", reclaimed))
-	}
 	if err := a.workerServices.EnsureRecurring(ctx); err != nil {
 		return err
 	}

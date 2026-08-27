@@ -135,7 +135,16 @@ func (r *Runner) Start(ctx context.Context) error {
 	count := r.options.WorkerCount
 	r.mu.Unlock()
 
-	// 过期租约的回收统一由启动流程负责，执行器本身不再扫描 jobs 全表。
+	// 启动时先回收上一个进程遗留的过期租约。回收只认 locked_until <= now，即租约
+	// 已经真正过期；这是过期租约的唯一定义，不受 24 小时安全余量影响，因此本实例
+	// 重启后能立刻把被前一个实例中断的作业交回队列。回收用独立上下文，避免随启动
+	// 取消信号一起丢失。
+	if reclaimed, err := r.jobs.ReclaimExpiredLeases(context.WithoutCancel(ctx), r.clock.Now()); err != nil {
+		r.logger.Error("启动时回收过期作业租约失败", slog.String("error", err.Error()))
+	} else if reclaimed > 0 {
+		r.logger.Info("启动时回收遗弃的作业租约", slog.Int("reclaimed", reclaimed))
+	}
+
 	for i := 0; i < count; i++ {
 		workerID := fmt.Sprintf("worker-%d", i+1)
 		r.wait.Add(1)
@@ -164,7 +173,9 @@ func (r *Runner) Stop() {
 	r.wait.Wait()
 }
 
-// loop polls the queue until the context is cancelled.
+// loop polls the queue until the context is cancelled. Every poll first
+// reclaims leases whose locked_until has passed so a crashed instance can no
+// longer strand a job in the running state.
 func (r *Runner) loop(ctx context.Context, workerID string) {
 	ticker := time.NewTicker(r.options.PollInterval)
 	defer ticker.Stop()
@@ -185,12 +196,19 @@ func (r *Runner) loop(ctx context.Context, workerID string) {
 	}
 }
 
-// Poll claims and executes at most one batch of due jobs.
+// Poll reclaims expired leases and then claims and executes at most one batch
+// of due jobs. Reclaiming before claiming is what lets a subsequently running
+// instance pick up the work a crashed instance left behind.
 func (r *Runner) Poll(ctx context.Context, workerID string) (int, error) {
 	if ctx.Err() != nil {
 		return 0, nil
 	}
-	claimed, err := r.jobs.ClaimDue(ctx, workerID, r.options.Lease, r.clock.Now(), r.options.BatchSize)
+	now := r.clock.Now()
+	// 回收租约用不可取消上下文，即使本轮 Poll 已被取消也要把过期作业交还队列。
+	if _, err := r.jobs.ReclaimExpiredLeases(context.WithoutCancel(ctx), now); err != nil {
+		return 0, err
+	}
+	claimed, err := r.jobs.ClaimDue(ctx, workerID, r.options.Lease, now, r.options.BatchSize)
 	if err != nil {
 		return 0, err
 	}

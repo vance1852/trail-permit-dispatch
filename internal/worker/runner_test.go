@@ -369,6 +369,59 @@ func TestRunnerStartReclaimsLeasesAndStopsCleanly(t *testing.T) {
 	}
 }
 
+// TestRunnerPollReclaimsExpiredLease simulates the reported outage: one instance
+// leased a job and was killed mid-flight, so the job stays running with a holder
+// that no longer exists. A subsequently running instance must reclaim the expired
+// lease during its poll, re-run the job and release the holder on completion.
+func TestRunnerPollReclaimsExpiredLease(t *testing.T) {
+	ctx := context.Background()
+	jobs := newFakeJobs()
+	fixed := clock.NewFixed(time.Date(2026, 9, 11, 8, 0, 0, 0, clock.Zone()))
+	runner := newTestRunner(jobs, fixed)
+
+	var executed int
+	runner.Register(domain.JobNotifyDispatch, func(context.Context, domain.Job) error {
+		executed++
+		return nil
+	})
+	job := &domain.Job{Kind: domain.JobNotifyDispatch, MaxAttempts: 3, RunAt: fixed.Now()}
+	if _, err := jobs.Enqueue(ctx, job); err != nil {
+		t.Fatalf("入队失败: %v", err)
+	}
+	// 第一个实例领取作业后被运维重启，作业永远卡在执行中。
+	if _, err := jobs.ClaimDue(ctx, "crashed-instance", time.Second, fixed.Now(), 1); err != nil {
+		t.Fatalf("模拟租约失败: %v", err)
+	}
+	fixed.Advance(2 * time.Second) // 租约早已过期。
+
+	stuck, err := jobs.ByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("读取作业失败: %v", err)
+	}
+	if stuck.State != domain.JobRunning || stuck.LockedBy != "crashed-instance" {
+		t.Fatalf("回收前应仍为执行中且持有者未释放: %+v", stuck)
+	}
+
+	// 随后运行的实例在轮询时回收过期租约并重新执行。
+	processed, err := runner.Poll(ctx, "worker-1")
+	if err != nil {
+		t.Fatalf("轮询失败: %v", err)
+	}
+	if processed != 1 || executed != 1 {
+		t.Fatalf("过期租约应被回收并重新执行: processed=%d executed=%d", processed, executed)
+	}
+	done, err := jobs.ByID(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("读取作业失败: %v", err)
+	}
+	if done.State != domain.JobDone || done.LockedBy != "" || done.LockedUntil != nil {
+		t.Fatalf("执行结束后应释放持有者并置为完成: %+v", done)
+	}
+	if jobs.reclaims == 0 {
+		t.Fatal("过期租约应通过回收路径返回队列")
+	}
+}
+
 func TestRunnerRequiresHandlersAndHonoursCancellation(t *testing.T) {
 	jobs := newFakeJobs()
 	fixed := clock.NewFixed(time.Date(2026, 9, 11, 8, 0, 0, 0, clock.Zone()))
